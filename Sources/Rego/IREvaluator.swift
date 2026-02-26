@@ -10,7 +10,7 @@ let localIdxData = Local(1)
 /// as hashing the values was proving extremely expensive. We instead rely on the
 /// invariant that the plan / evaluator will not modify a local after it has been initally set.
 struct InvocationKey: Hashable {
-    let funcName: String
+    let funcIndex: Int
     let args: [IR.Operand]
 }
 
@@ -88,10 +88,25 @@ internal struct IndexedIRPolicy {
     // Policy plans indexed by plan name (aka query name)
     var plans: [String: IR.Plan] = [:]
 
-    // Policy functions indexed by function name
+    // Policy functions indexed by function name (kept for error messages and backward compat)
     var funcs: [String: IR.Func] = [:]
 
-    // Policy functions indexed by path name
+    // Policy functions as dense array for O(1) index-based dispatch
+    var funcsByIndex: [IR.Func] = []
+
+    // Maps function name to dense index (for init-time resolution)
+    var funcNameToIndex: [String: Int] = [:]
+
+    // Maps function path to dense index (for dynamic call runtime resolution)
+    var funcPathToIndex: [String: Int] = [:]
+
+    // Maps builtin name to dense index (for init-time resolution)
+    var builtinNameToIndex: [String: Int] = [:]
+
+    // Total plan function count, used to offset builtin indices in InvocationKey
+    var planFuncCount: Int = 0
+
+    // Policy functions indexed by path name (kept for backward compat)
     var funcsPathToName: [String: String] = [:]
 
     // Policy static values, indexes match original plan array
@@ -104,20 +119,43 @@ internal struct IndexedIRPolicy {
         var preparedPolicy = policy
         try preparedPolicy.prepareForExecution()
 
-        self.ir = preparedPolicy
-        for plan in preparedPolicy.plans?.plans ?? [] {
-            // TODO: is plan.name actually the right string format to
-            // match a query string? If no, convert it here.
-            // TODO: validator should ensure these names were unique
-            self.plans[plan.name] = plan
-        }
-        for funcDecl in preparedPolicy.funcs?.funcs ?? [] {
-            // TODO: validator should ensure these names were unique
+        // Build function name→index maps and dense array
+        var nameToFuncRef: [String: IR.FuncRef] = [:]
+        for (index, funcDecl) in (preparedPolicy.funcs?.funcs ?? []).enumerated() {
             self.funcs[funcDecl.name] = funcDecl
+            self.funcsByIndex.append(funcDecl)
+            self.funcNameToIndex[funcDecl.name] = index
+            nameToFuncRef[funcDecl.name] = .planFunc(index)
             if !funcDecl.path.isEmpty {
-                self.funcsPathToName[funcDecl.path.joined(separator: ".")] = funcDecl.name
+                let pathKey = funcDecl.path.joined(separator: ".")
+                self.funcsPathToName[pathKey] = funcDecl.name
+                self.funcPathToIndex[pathKey] = index
             }
         }
+        self.planFuncCount = self.funcsByIndex.count
+
+        // Collect all call function names from the IR using a single walk pass,
+        // then identify which ones are builtins (not plan functions)
+        let allCallNames = preparedPolicy.collectCallFuncNames()
+        let builtinNames = allCallNames.subtracting(self.funcNameToIndex.keys)
+
+        // Assign dense indices to builtins
+        for (index, name) in builtinNames.sorted().enumerated() {
+            self.builtinNameToIndex[name] = index
+            nameToFuncRef[name] = .builtin(index)
+        }
+
+        // Run static analysis pass to stamp each CallStatement with its FuncRef
+        preparedPolicy.resolveFuncRefs(nameToFuncRef: nameToFuncRef)
+
+        self.ir = preparedPolicy
+        for plan in preparedPolicy.plans?.plans ?? [] {
+            self.plans[plan.name] = plan
+        }
+
+        // Re-populate funcsByIndex from the stamped policy (CallStatements within
+        // function blocks now carry their resolved FuncRef)
+        self.funcsByIndex = preparedPolicy.funcs?.funcs ?? []
 
         let numberFormatter = NumberFormatter()
         numberFormatter.numberStyle = .decimal
@@ -171,11 +209,33 @@ internal final class IREvaluationContext {
     // Pool for reusing args arrays
     private var argsPool: [[AST.RegoValue]] = []
 
+    // Reusable builtin context — only location changes per call
+    var builtinContext: BuiltinContext
+
+    // Dense array of pre-resolved builtin function pointers for O(1) index-based dispatch.
+    // Indices match policy.builtinNameToIndex.
+    private var builtinsByIndex: [Builtin?]
+
+    // Fallback cache for builtins not known at policy-load time (e.g. dynamic calls)
+    private var builtinCache: [String: Builtin] = [:]
+
     init(ctx: EvaluationContext, policy: IndexedIRPolicy) {
         self.ctx = ctx
         self.policy = policy
         self.tracingEnabled = ctx.tracer != nil
         self.results = ResultSet.empty
+        self.builtinContext = BuiltinContext(
+            tracer: ctx.tracer,
+            cache: ctx.builtinsCache,
+            timestamp: ctx.timestamp,
+            rand: ctx.builtinsRand
+        )
+
+        // Pre-resolve builtins into dense array for O(1) dispatch
+        self.builtinsByIndex = Array(repeating: nil, count: policy.builtinNameToIndex.count)
+        for (name, index) in policy.builtinNameToIndex {
+            self.builtinsByIndex[index] = ctx.builtins[name]
+        }
     }
 
     subscript(key: InvocationKey) -> AST.RegoValue? {
@@ -273,6 +333,24 @@ internal final class IREvaluationContext {
     func releaseArgs(_ args: inout [AST.RegoValue]) {
         args.removeAll(keepingCapacity: true)
         argsPool.append(args)
+    }
+
+    /// Resolve a builtin function by pre-assigned index (O(1) array access).
+    func resolveBuiltin(index: Int) -> Builtin? {
+        return builtinsByIndex[index]
+    }
+
+    /// Resolve a builtin function by name, caching the result for future lookups.
+    /// Used as fallback for dynamic calls not resolved at policy-load time.
+    func resolveBuiltin(name: String) -> Builtin? {
+        if let cached = builtinCache[name] {
+            return cached
+        }
+        if let builtin = ctx.builtins[name] {
+            builtinCache[name] = builtin
+            return builtin
+        }
+        return nil
     }
 
     func traceEvent(
@@ -579,7 +657,7 @@ func evalBlock(
             return BlockResult(breakCounter: stmt.index)
 
         case .callDynamicStmt(let stmt):
-            var funcName = ""
+            var funcPath = ""
             for i in stmt.path.indices {
                 let p = stmt.path[i]
                 let segment = ctx.resolveOperand(p)
@@ -587,15 +665,24 @@ func evalBlock(
                     return failWithUndefined(withContext: ctx, stmt: statement)
                 }
                 if i > 0 {
-                    funcName += "."
+                    funcPath += "."
                 }
-                funcName += stringValue
+                funcPath += stringValue
+            }
+
+            // Resolve path to index at runtime (1 dict lookup instead of 2)
+            let funcRef: IR.FuncRef
+            if let idx = ctx.policy.funcPathToIndex[funcPath] {
+                funcRef = .planFunc(idx)
+            } else {
+                funcRef = .unresolved
             }
 
             let result = try await evalCall(
                 ctx: ctx,
                 caller: statement,
-                funcName: funcName,
+                funcName: funcPath,
+                funcRef: funcRef,
                 args: stmt.args.map {  // (╯°□°)╯︵ ┻━┻
                     // TODO: make the CallDynamicStatement "args" match the CallStatement ones upstream..
                     IR.Operand(
@@ -615,6 +702,7 @@ func evalBlock(
                 ctx: ctx,
                 caller: statement,
                 funcName: stmt.callFunc,
+                funcRef: stmt.resolvedFuncRef,
                 args: stmt.args ?? []
             )
 
@@ -946,12 +1034,27 @@ private func evalCall(
     ctx: IREvaluationContext,
     caller: IR.Statement,
     funcName: String,
+    funcRef: IR.FuncRef,
     args: [IR.Operand],
     isDynamic: Bool = false
 ) async throws -> AST.RegoValue {
+    // Compute a unified integer index for the InvocationKey memo cache.
+    // Plan funcs use their index directly; builtins are offset by planFuncCount;
+    // unresolved uses a sentinel value (won't memo-collide since funcName differs).
+    let memoIndex: Int
+    switch funcRef {
+    case .planFunc(let idx):
+        memoIndex = idx
+    case .builtin(let idx):
+        memoIndex = ctx.policy.planFuncCount + idx
+    case .unresolved:
+        // Use a deterministic but unlikely-to-collide index
+        memoIndex = ctx.policy.planFuncCount + ctx.policy.builtinNameToIndex.count + funcName.hashValue
+    }
+
     // Check memo cache if applicable to save repeated evaluation time for rules
     let shouldMemoize = args.count == 2  // Currently support _rules_, not _functions_
-    let sig = InvocationKey(funcName: funcName, args: args)
+    let sig = InvocationKey(funcIndex: memoIndex, args: args)
     if shouldMemoize, let cachedResult = ctx[sig] {
         return cachedResult
     }
@@ -968,69 +1071,108 @@ private func evalCall(
         argValues.append(ctx.resolveOperand(arg))
     }
 
-    if isDynamic {
-        // CallDynamicStmt doesn't reference functions by name (as labeled in the IR), it will be by path,
-        // eg, ["g0", "a", "b"] versus the "name" like "g0.data.a.b"
-        // We strigify the path first so they come in here looking like "g0.a.b".
-        // If the function is not found in the policy, it is valid but undefined.
-        guard let funcName = ctx.policy.funcsPathToName[funcName] else {
-            return .undefined
-        }
-
-        // funcsPathToName and funcs are built together, so this must succeed
-        let fn = ctx.policy.funcs[funcName]!
-
+    switch funcRef {
+    case .planFunc(let idx):
+        let fn = ctx.policy.funcsByIndex[idx]
         let result = try await callPlanFunc(
             ctx: ctx,
             caller: caller,
             fn: fn,
             args: argValues
         )
-
         if shouldMemoize {
             ctx[sig] = result
         }
         return result
-    }
 
-    // Handle plan-defined functions first
-    if let fn = ctx.policy.funcs[funcName] {
-        let result = try await callPlanFunc(
-            ctx: ctx,
-            caller: caller,
-            fn: fn,
-            args: argValues
-        )
-
-        if shouldMemoize {
-            ctx[sig] = result
+    case .builtin(let idx):
+        // We won't bother invoking the builtin function if one of the arguments is undefined
+        for argValue in argValues {
+            guard argValue != .undefined else {
+                return .undefined
+            }
         }
 
-        return result
-    }
+        // Reuse the cached BuiltinContext, only updating location when tracing is enabled
+        if ctx.tracingEnabled {
+            ctx.builtinContext.location = try ctx.currentLocation(stmt: caller)
+        }
 
-    // Handle built-in functions last
+        guard let builtin = ctx.resolveBuiltin(index: idx) else {
+            throw BuiltinRegistry.RegistryError.builtinNotFound(name: funcName)
+        }
+        do {
+            return try await builtin(ctx.builtinContext, argValues)
+        } catch {
+            if BuiltinError.isHaltError(error) {
+                throw error
+            }
+            if ctx.ctx.strictBuiltins {
+                throw error
+            }
+            return .undefined
+        }
 
-    // We won't bother invoking the builtin function if one of the arguments is undefined
-    for argValue in argValues {
-        guard argValue != .undefined else {
+    case .unresolved:
+        // Fallback to string-based resolution for dynamic/unresolved calls
+        if isDynamic {
+            guard let resolvedName = ctx.policy.funcsPathToName[funcName] else {
+                return .undefined
+            }
+            // funcsPathToName and funcs are built together, so this must succeed
+            let fn = ctx.policy.funcs[resolvedName]!
+            let result = try await callPlanFunc(
+                ctx: ctx,
+                caller: caller,
+                fn: fn,
+                args: argValues
+            )
+            if shouldMemoize {
+                ctx[sig] = result
+            }
+            return result
+        }
+
+        // Try plan-defined functions first
+        if let fn = ctx.policy.funcs[funcName] {
+            let result = try await callPlanFunc(
+                ctx: ctx,
+                caller: caller,
+                fn: fn,
+                args: argValues
+            )
+            if shouldMemoize {
+                ctx[sig] = result
+            }
+            return result
+        }
+
+        // Fall back to builtin lookup
+        for argValue in argValues {
+            guard argValue != .undefined else {
+                return .undefined
+            }
+        }
+
+        if ctx.tracingEnabled {
+            ctx.builtinContext.location = try ctx.currentLocation(stmt: caller)
+        }
+
+        guard let builtin = ctx.resolveBuiltin(name: funcName) else {
+            throw BuiltinRegistry.RegistryError.builtinNotFound(name: funcName)
+        }
+        do {
+            return try await builtin(ctx.builtinContext, argValues)
+        } catch {
+            if BuiltinError.isHaltError(error) {
+                throw error
+            }
+            if ctx.ctx.strictBuiltins {
+                throw error
+            }
             return .undefined
         }
     }
-
-    let bctx = BuiltinContext(
-        location: try ctx.currentLocation(stmt: caller),
-        tracer: ctx.ctx.tracer,
-        cache: ctx.ctx.builtinsCache,
-        timestamp: ctx.ctx.timestamp
-    )
-
-    return try await ctx.ctx.builtins.invoke(
-        withContext: bctx,
-        name: funcName,
-        args: argValues,
-        strict: ctx.ctx.strictBuiltins
-    )
 }
 
 // callPlanFunc will evaluate calling a function defined on the plan

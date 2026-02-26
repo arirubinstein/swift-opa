@@ -317,6 +317,78 @@ extension Operand {
     }
 }
 
+// MARK: - Function Reference Resolution
+
+extension Policy {
+    /// Walk all plan blocks and function blocks, stamping each CallStatement
+    /// with a pre-resolved FuncRef for O(1) dispatch at evaluation time.
+    public mutating func resolveFuncRefs(nameToFuncRef: [String: FuncRef]) {
+        if var plans = self.plans {
+            for i in plans.plans.indices {
+                for j in plans.plans[i].blocks.indices {
+                    plans.plans[i].blocks[j].walk { statement in
+                        if case .callStmt(var stmt) = statement {
+                            if let ref = nameToFuncRef[stmt.callFunc] {
+                                stmt.resolvedFuncRef = ref
+                                statement = .callStmt(stmt)
+                            }
+                        }
+                    }
+                }
+            }
+            self.plans = plans
+        }
+
+        if var funcs = self.funcs {
+            if var funcList = funcs.funcs {
+                for i in funcList.indices {
+                    for j in funcList[i].blocks.indices {
+                        funcList[i].blocks[j].walk { statement in
+                            if case .callStmt(var stmt) = statement {
+                                if let ref = nameToFuncRef[stmt.callFunc] {
+                                    stmt.resolvedFuncRef = ref
+                                    statement = .callStmt(stmt)
+                                }
+                            }
+                        }
+                    }
+                }
+                funcs.funcs = funcList
+            }
+            self.funcs = funcs
+        }
+    }
+
+    /// Collect all function names referenced by CallStatements in the IR.
+    /// Used by IndexedIRPolicy to discover builtin names at init time.
+    public func collectCallFuncNames() -> Set<String> {
+        var names = Set<String>()
+        if let plans = self.plans {
+            for plan in plans.plans {
+                for var block in plan.blocks {
+                    block.walk { statement in
+                        if case .callStmt(let stmt) = statement {
+                            names.insert(stmt.callFunc)
+                        }
+                    }
+                }
+            }
+        }
+        if let funcList = self.funcs?.funcs {
+            for funcDecl in funcList {
+                for var block in funcDecl.blocks {
+                    block.walk { statement in
+                        if case .callStmt(let stmt) = statement {
+                            names.insert(stmt.callFunc)
+                        }
+                    }
+                }
+            }
+        }
+        return names
+    }
+}
+
 // MARK: - Number Index Identification
 
 extension Plan {

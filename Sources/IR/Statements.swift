@@ -108,12 +108,24 @@ public struct CallDynamicStatement: Sendable, Codable, Hashable {
     public var result: Local
 }
 
-public struct CallStatement: Sendable, Codable, Hashable {
+/// Pre-resolved function reference for O(1) dispatch in evalCall.
+/// Assigned during static analysis (resolveFuncRefs pass) at policy-load time.
+public enum FuncRef: Sendable {
+    case planFunc(Int)    // Index into IndexedIRPolicy.funcsByIndex
+    case builtin(Int)     // Index into IREvaluationContext.builtinsByIndex
+    case unresolved       // Not yet resolved (dynamic calls or pre-analysis)
+}
+
+public struct CallStatement: Sendable, Codable {
     public var location: Location = Location()
 
     public var callFunc: String = ""
     public var args: [Operand]? = []
     public var result: Local = 0
+
+    /// Pre-resolved function reference, stamped by resolveFuncRefs static analysis pass.
+    /// Excluded from Codable (not in CodingKeys) and from Hashable/Equatable.
+    public var resolvedFuncRef: FuncRef = .unresolved
 
     enum CodingKeys: String, CodingKey {
         case callFunc = "func"
@@ -126,6 +138,24 @@ public struct CallStatement: Sendable, Codable, Hashable {
         self.callFunc = callFunc
         self.args = args
         self.result = result
+    }
+}
+
+extension CallStatement: Equatable {
+    public static func == (lhs: CallStatement, rhs: CallStatement) -> Bool {
+        lhs.location == rhs.location
+            && lhs.callFunc == rhs.callFunc
+            && lhs.args == rhs.args
+            && lhs.result == rhs.result
+    }
+}
+
+extension CallStatement: Hashable {
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(location)
+        hasher.combine(callFunc)
+        hasher.combine(args)
+        hasher.combine(result)
     }
 }
 
