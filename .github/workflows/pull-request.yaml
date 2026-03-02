@@ -130,6 +130,99 @@ jobs:
           diff_and_print main-passed pr-passed 'passed (main vs PR)' >> $GITHUB_STEP_SUMMARY
           diff_and_print main-failed pr-failed 'failed (main vs PR)' >> $GITHUB_STEP_SUMMARY
 
+  benchmark:
+    name: benchmark comparison (vs base)
+    runs-on: macos-latest
+    continue-on-error: true
+    env:
+      BENCHMARK_MAX_DURATION_SECONDS: "3"
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Select Xcode version
+        id: xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app
+          echo "swift-version=$(swift --version | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)" >> "$GITHUB_OUTPUT"
+          swift --version
+      - name: Install jemalloc
+        run: brew install jemalloc
+      - name: Checkout base branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: Checkout PR
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: pr
+          persist-credentials: false
+      - name: Restore base .build cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: base/Benchmarks/.build
+          key: benchmark-build-${{ runner.os }}-swift${{ steps.xcode.outputs.swift-version }}-base-${{ github.event.pull_request.base.sha }}
+          restore-keys: benchmark-build-${{ runner.os }}-swift${{ steps.xcode.outputs.swift-version }}-base-
+      - name: Restore PR .build cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: pr/Benchmarks/.build
+          key: benchmark-build-${{ runner.os }}-swift${{ steps.xcode.outputs.swift-version }}-pr-${{ github.sha }}
+          restore-keys: benchmark-build-${{ runner.os }}-swift${{ steps.xcode.outputs.swift-version }}-pr-
+      - name: Run benchmarks on base and save baseline
+        run: |
+          sudo -E swift package -c release --disable-sandbox \
+            --package-path Benchmarks \
+            benchmark baseline update base \
+            --no-progress
+        working-directory: base
+      - name: Copy baseline to PR checkout
+        run: sudo cp -R base/Benchmarks/.benchmarkBaselines pr/Benchmarks/.benchmarkBaselines
+      - name: Compare PR benchmarks against baseline
+        id: compare
+        run: |
+          set +e
+          sudo -E swift package -c release --disable-sandbox \
+            --package-path Benchmarks \
+            benchmark baseline compare base \
+            --no-progress \
+            --format markdown \
+            2>/dev/null \
+            | tee benchmark-comparison.md
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+          case "${EXIT_CODE}" in
+            0) SUMMARY="✅ No significant performance changes" ;;
+            2) SUMMARY="❌ Potential performance regression detected 📉" ;;
+            4) SUMMARY="⚠️ Performance improvement detected 📈" ;;
+            *) SUMMARY="❓ Benchmark comparison completed (exit code: ${EXIT_CODE})" ;;
+          esac
+          echo "summary=${SUMMARY}" >> "$GITHUB_OUTPUT"
+        working-directory: pr
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUMMARY: ${{ steps.compare.outputs.summary }}
+        run: |
+          {
+            echo "## Benchmark Comparison"
+            echo ""
+            echo "${SUMMARY}"
+            echo ""
+            printf '<details>\n  <summary>Full comparison output</summary>\n\n%s\n\n</details>\n' \
+              "$(cat pr/benchmark-comparison.md)"
+          } | pr/tools/build/release-pr-comment.sh \
+            "${{ github.repository }}" \
+            "${{ github.event.pull_request.number }}" \
+            "<!-- benchmark-comparison -->"
+
   capabilities-check:
     name: check capabilities.json unchanged
     runs-on: macos-latest
