@@ -1,7 +1,6 @@
 name: Check
 
 on:
-  workflow_dispatch: {}
   pull_request: {}
 
 # When a new revision is pushed to a PR, cancel all in-progress CI runs for that
